@@ -1,0 +1,92 @@
+@import "tailwindcss";
+
+@theme {
+  --color-cream: #F5F0E8;
+  --color-dark: #1A1714;
+  --color-red: #C43A2B;
+  --color-gold: #D4A853;
+  --color-film-border: #2A2520;
+  --color-landing-bg: #CEFCE9;
+  --color-landing-dark: #3A3A3A;
+  --color-input-bg: rgba(245, 240, 232, 0.06);
+  --color-input-border: rgba(245, 240, 232, 0.15);
+  --color-input-focus: rgba(212, 168, 83, 0.4);
+  --color-success: #4A9B6E;
+
+  --font-display: 'Playfair Display', serif;
+  --font-mono: 'DM Mono', monospace;
+  --font-courier: 'Courier Prime', monospace;
+}
+
+/* ── BASE ── */
+* { -webkit-tap-highlight-color: transparent; }
+body { -webkit-user-select: none; user-select: none; }
+
+/* ── GRAIN OVERLAY ── */
+.grain-overlay {
+  position: fixed; inset: 0; pointer-events: none; z-index: 1000; opacity: 0.05;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 200px;
+}
+
+/* ── BOOTH ICON ── */
+.booth-icon .strip::before {
+  content: ''; position: absolute; top: 6px; left: 5px; right: 5px;
+  height: 14px; background: rgba(255,255,255,0.2); border-radius: 1px;
+  box-shadow: 0 18px 0 rgba(255,255,255,0.2), 0 36px 0 rgba(255,255,255,0.2),
+              0 54px 0 rgba(255,255,255,0.2), 0 72px 0 rgba(255,255,255,0.2);
+}
+
+/* ── COUNTDOWN ── */
+@keyframes countPulse {
+  0% { transform: scale(1.6); opacity: 0; }
+  30% { opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+.countdown-anim { animation: countPulse 1s ease-out; }
+
+/* ── FLASH ── */
+@keyframes flashAnim { 0% { opacity: 1; } 100% { opacity: 0; } }
+.flash { opacity: 1; animation: flashAnim 0.35s ease-out forwards; }
+
+/* ── BLINK ── */
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+.blink { animation: blink 0.8s ease infinite; }
+
+/* ── PROCESSING BOB ── */
+@keyframes processBob {
+  0%, 100% { transform: translateY(0) rotate(-2deg); }
+  50% { transform: translateY(-10px) rotate(2deg); }
+}
+.process-bob { animation: processBob 1.5s ease-in-out infinite; }
+
+/* ── FADE IN ── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.fade-in { animation: fadeIn 0.6s ease-out forwards; }
+.fade-in-delay { animation-delay: 0.15s; opacity: 0; }
+.fade-in-delay-2 { animation-delay: 0.3s; opacity: 0; }
+
+/* ── SCALE IN ── */
+@keyframes scaleIn { 0% { transform: scale(0); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+.scale-in { animation: scaleIn 0.5s cubic-bezier(0.34, 1.56, 0.64, 1); }
+
+/* ── SPINNER ── */
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── PHOTO STRIP DATE STAMP ── */
+.photo-strip::after {
+  content: attr(data-date); position: absolute; bottom: 7px; left: 50%;
+  transform: translateX(-50%); font-family: var(--font-courier);
+  font-weight: 700; font-size: 0.45rem; letter-spacing: 0.25em;
+  color: var(--strip-text-color, var(--color-film-border)); text-transform: uppercase; white-space: nowrap;
+}
+
+/* ── SELECT DROPDOWN ARROW ── */
+select.field-input {
+  appearance: none; -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%23F5F0E8' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 0.75rem center; padding-right: 2rem;
+}

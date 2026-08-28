@@ -8,7 +8,12 @@ const csp = [
   // blob:/data: cover the canvas-generated strip previews.
   "img-src 'self' data: blob:",
   "media-src 'self' blob:",
-  "connect-src 'self'",
+  // 'self' covers this app's own API routes (order submission, upload
+  // authorization). The blob-storage domain is separate: photo frames
+  // upload directly from the browser to storage, bypassing this app's
+  // functions entirely, so that host must be explicitly allowed or the
+  // browser silently blocks every upload request.
+  "connect-src 'self' https://*.public.blob.vercel-storage.com",
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "form-action 'self'",

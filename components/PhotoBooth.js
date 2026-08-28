@@ -7,6 +7,7 @@ import {
   UNIT_PRICE, SHIPPING, MAX_QTY, TEST_MODE, BG_COLORS, BG_TEXT_COLORS, US_STATES,
 } from '@/lib/config';
 import { validateOrder, LIMITS } from '@/lib/validation';
+import { uploadOrderAssets } from '@/lib/blob-upload';
 
 const EMPTY_DOTS = Array(PHOTO_COUNT).fill(false);
 const STRIP_LETTERS = ['S', 'T', 'R', 'I', 'P'];
@@ -46,6 +47,7 @@ export default function PhotoBooth() {
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState('');
   const [orderId, setOrderId] = useState('');
+  const [uploadProgress, setUploadProgress] = useState(null);
   const [form, setForm] = useState(EMPTY_FORM);
   const [giftForm, setGiftForm] = useState(EMPTY_GIFT);
   const [errors, setErrors] = useState({});
@@ -59,6 +61,11 @@ export default function PhotoBooth() {
   // mid-capture cannot fire a state update on a dead component.
   const timersRef = useRef(new Set());
   const abortRef = useRef(false);
+  // Uploaded asset URLs, cached so a failed submit can be retried
+  // without re-uploading megabytes the user already spent time on.
+  const uploadCacheRef = useRef(null);
+  const uploadSessionRef = useRef(null);
+  const uploadAbortRef = useRef(null);
 
   const clearTimers = useCallback(() => {
     timersRef.current.forEach(clearTimeout);
@@ -367,26 +374,58 @@ export default function PhotoBooth() {
       return;
     }
 
+    if (photosRef.current.length !== PHOTO_COUNT) {
+      setSubmitError('Your photos are missing. Please retake your strip.');
+      return;
+    }
+
     setSubmitting(true);
+    const controller = new AbortController();
+    uploadAbortRef.current = controller;
+
     try {
-      const stripImage = await generateStripCanvas();
+      // One session id groups this order's files under a single prefix.
+      // The server validates the path shape, so a token cannot be used
+      // to write anywhere else in the bucket.
+      uploadSessionRef.current ||= (crypto.randomUUID?.()
+        || Math.random().toString(36).slice(2) + Date.now().toString(36));
+
+      const stripDataUrl = await generateStripCanvas();
+
+      setUploadProgress({ completed: 0, total: PHOTO_COUNT + 1 });
+      const { frameUrls, stripUrl } = await uploadOrderAssets({
+        frames: photosRef.current,
+        stripDataUrl,
+        sessionId: uploadSessionRef.current,
+        signal: controller.signal,
+        onProgress: setUploadProgress,
+        cache: uploadCacheRef,
+      });
+      setUploadProgress(null);
+
       const res = await fetch('/api/orders', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...order, stripImage, paymentMethod }),
+        body: JSON.stringify({ ...order, frameUrls, stripUrl, paymentMethod }),
+        signal: controller.signal,
       });
 
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
         if (body?.errors) setErrors(body.errors);
+        // 429 and 5xx are worth retrying; a 400 is not, so the cached
+        // uploads stay valid either way and are never re-sent.
         throw new Error(body?.message || 'We could not place your order.');
       }
 
       setOrderId(body.orderId || '');
       setScreen('confirmation');
     } catch (err) {
+      setUploadProgress(null);
+      if (err?.name === 'AbortError' || controller.signal.aborted) return;
       setSubmitError(err?.message || 'Something went wrong. Please try again.');
     } finally {
+      uploadAbortRef.current = null;
       setSubmitting(false);
     }
   }, [submitting, buildOrder, generateStripCanvas]);
@@ -402,6 +441,9 @@ export default function PhotoBooth() {
 
   const retake = useCallback(async () => {
     setPhotos([]); photosRef.current = [];
+    // New photos mean the uploaded assets no longer describe this order.
+    uploadCacheRef.current = null;
+    uploadSessionRef.current = null;
     setCapturedDots(EMPTY_DOTS); setPhotoCount(0);
     setSubmitError('');
     abortRef.current = false;
@@ -412,6 +454,8 @@ export default function PhotoBooth() {
   const startOver = useCallback(() => {
     leaveCapture();
     setPhotos([]); photosRef.current = [];
+    uploadCacheRef.current = null;
+    uploadSessionRef.current = null;
     setSelectedBg('white'); setSelectedFilter('original');
     setOrderQty(1); setGiftMode(false);
     setForm(EMPTY_FORM); setGiftForm(EMPTY_GIFT);
@@ -430,6 +474,8 @@ export default function PhotoBooth() {
     timersRef.current.forEach(clearTimeout);
     timersRef.current.clear();
     if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+    // Abandon any in-flight upload rather than leaking the request.
+    uploadAbortRef.current?.abort();
   }, []);
 
   // Release the camera whenever the app is backgrounded outside capture.
@@ -580,7 +626,7 @@ export default function PhotoBooth() {
             <div className="text-[0.55rem] tracking-[0.15em] uppercase text-cream/40 mb-2 text-center">Photo Style</div>
             <div className="flex gap-2 justify-center">
               {['original', 'bw', 'sepia'].map((f) => (
-                <button key={f} onClick={() => setSelectedFilter(f)} aria-pressed={selectedFilter === f} className={`px-3 py-1.5 rounded-full text-[0.55rem] tracking-[0.1em] uppercase transition-all active:scale-[0.94] border ${selectedFilter === f ? 'border-gold text-gold bg-gold/[0.08]' : 'border-cream/10 text-cream/50 bg-transparent'}`}>
+                <button key={f} onClick={() => { setSelectedFilter(f); uploadCacheRef.current = null; }} aria-pressed={selectedFilter === f} className={`px-3 py-1.5 rounded-full text-[0.55rem] tracking-[0.1em] uppercase transition-all active:scale-[0.94] border ${selectedFilter === f ? 'border-gold text-gold bg-gold/[0.08]' : 'border-cream/10 text-cream/50 bg-transparent'}`}>
                   {f === 'bw' ? 'B&W' : f.charAt(0).toUpperCase() + f.slice(1)}
                 </button>
               ))}
@@ -591,7 +637,7 @@ export default function PhotoBooth() {
             <div className="text-[0.55rem] tracking-[0.15em] uppercase text-cream/40 mb-2 text-center">Strip Background</div>
             <div className="flex gap-2 justify-center">
               {Object.entries(BG_COLORS).map(([key, color]) => (
-                <button key={key} onClick={() => setSelectedBg(key)} aria-label={`${key} background`} aria-pressed={selectedBg === key} className={`w-12 h-12 rounded-lg transition-all active:scale-[0.92] border-2 ${selectedBg === key ? 'border-gold shadow-[0_0_0_2px_rgba(212,168,83,0.3),0_2px_8px_rgba(0,0,0,0.3)]' : 'border-cream/10'}`} style={{ background: color }} />
+                <button key={key} onClick={() => { setSelectedBg(key); uploadCacheRef.current = null; }} aria-label={`${key} background`} aria-pressed={selectedBg === key} className={`w-12 h-12 rounded-lg transition-all active:scale-[0.92] border-2 ${selectedBg === key ? 'border-gold shadow-[0_0_0_2px_rgba(212,168,83,0.3),0_2px_8px_rgba(0,0,0,0.3)]' : 'border-cream/10'}`} style={{ background: color }} />
               ))}
             </div>
           </div>
@@ -706,7 +752,9 @@ export default function PhotoBooth() {
 
           <button onClick={() => submitOrder('card')} disabled={submitting} className="w-full py-4 rounded-lg bg-red text-cream font-[Courier_Prime,monospace] font-bold text-sm tracking-[0.15em] uppercase active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none transition-all" style={{ boxShadow: '0 4px 16px rgba(196,58,43,0.25)' }}>
             {submitting
-              ? <span className="block w-[18px] h-[18px] border-2 border-white/30 border-t-cream rounded-full mx-auto" style={{ animation: 'spin 0.6s linear infinite' }} />
+              ? (uploadProgress
+                ? <span>Uploading photos… {uploadProgress.completed}/{uploadProgress.total}</span>
+                : <span className="block w-[18px] h-[18px] border-2 border-white/30 border-t-cream rounded-full mx-auto" style={{ animation: 'spin 0.6s linear infinite' }} />)
               : <span>{TEST_MODE ? 'Submit Preview Order' : `Place Order — ${formatCents(total)}`}</span>}
           </button>
 

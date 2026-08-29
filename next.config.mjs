@@ -9,11 +9,14 @@ const csp = [
   "img-src 'self' data: blob:",
   "media-src 'self' blob:",
   // 'self' covers this app's own API routes (order submission, upload
-  // authorization). The blob-storage domain is separate: photo frames
-  // upload directly from the browser to storage, bypassing this app's
-  // functions entirely, so that host must be explicitly allowed or the
-  // browser silently blocks every upload request.
-  "connect-src 'self' https://*.public.blob.vercel-storage.com",
+  // authorization). Blob storage is separate: photo frames upload
+  // directly from the browser to Vercel's storage API, bypassing this
+  // app's functions entirely. blob.vercel-storage.com issues the actual
+  // PUT; *.public.blob.vercel-storage.com is where uploaded files are
+  // later read back from. Both must be allowed or the browser silently
+  // blocks the request — confirmed against the exact host in a live
+  // CSP violation, not guessed from documentation.
+  "connect-src 'self' https://blob.vercel-storage.com https://*.public.blob.vercel-storage.com",
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "form-action 'self'",

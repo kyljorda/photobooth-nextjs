@@ -77,11 +77,19 @@ input, select, textarea { -webkit-user-select: text; user-select: text; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ── PHOTO STRIP DATE STAMP ── */
+.photo-strip::before {
+  content: attr(data-brand); position: absolute; bottom: 19px; left: 50%;
+  transform: translateX(-50%); font-family: var(--font-courier);
+  font-weight: 700; font-size: 0.5rem; letter-spacing: 0.22em;
+  color: var(--strip-text-color, var(--color-film-border)); text-transform: uppercase; white-space: nowrap;
+}
+
 .photo-strip::after {
   content: attr(data-date); position: absolute; bottom: 7px; left: 50%;
   transform: translateX(-50%); font-family: var(--font-courier);
-  font-weight: 700; font-size: 0.45rem; letter-spacing: 0.25em;
-  color: var(--strip-text-color, var(--color-film-border)); text-transform: uppercase; white-space: nowrap;
+  font-weight: 700; font-size: 0.42rem; letter-spacing: 0.2em;
+  color: var(--strip-text-color, var(--color-film-border)); opacity: 0.75;
+  text-transform: uppercase; white-space: nowrap;
 }
 
 /* ── SELECT DROPDOWN ARROW ── */

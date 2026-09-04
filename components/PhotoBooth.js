@@ -20,6 +20,19 @@ function getDateString() {
   });
 }
 
+// Canvas has no reliable letter-spacing across browsers (ctx.letterSpacing
+// is recent and unsupported on older Safari), so space glyphs manually.
+function drawSpacedText(ctx, text, centerX, y, spacing) {
+  const chars = [...text];
+  const widths = chars.map((c) => ctx.measureText(c).width);
+  const total = widths.reduce((a, b) => a + b, 0) + spacing * (chars.length - 1);
+  const prevAlign = ctx.textAlign;
+  ctx.textAlign = 'left';
+  let x = centerX - total / 2;
+  chars.forEach((c, i) => { ctx.fillText(c, x, y); x += widths[i] + spacing; });
+  ctx.textAlign = prevAlign;
+}
+
 function getFilterCSS(f) {
   if (f === 'bw') return 'grayscale(1) contrast(1.06)';
   if (f === 'sepia') return 'sepia(0.72) contrast(1.04) saturate(0.9)';
@@ -40,6 +53,8 @@ export default function PhotoBooth() {
   const [capturing, setCapturing] = useState(false);
   const [countdownNum, setCountdownNum] = useState(null);
   const [flashActive, setFlashActive] = useState(false);
+  const [switchingCamera, setSwitchingCamera] = useState(false);
+  const [cameraNotice, setCameraNotice] = useState('');
   const [capturedDots, setCapturedDots] = useState(EMPTY_DOTS);
   const [photoCount, setPhotoCount] = useState(0);
   const [orderQty, setOrderQty] = useState(1);
@@ -57,6 +72,12 @@ export default function PhotoBooth() {
   const canvasRef = useRef(null);
   const stripCanvasRef = useRef(null);
   const photosRef = useRef([]);
+  // startCapture runs as a ~15s async loop. Reading facingMode from its
+  // closure would give the value from when the loop STARTED, so flipping
+  // mid-strip would mirror later frames using the old camera's setting.
+  // A ref is always current.
+  const facingRef = useRef('user');
+  const switchingRef = useRef(false);
   // Every pending timer is registered here so navigating away or unmounting
   // mid-capture cannot fire a state update on a dead component.
   const timersRef = useRef(new Set());
@@ -95,30 +116,82 @@ export default function PhotoBooth() {
       return;
     }
 
+    // `exact` genuinely forces the requested camera. With a plain
+    // facingMode string many phones simply hand back the front camera
+    // again — which is why the flip button appeared to do nothing.
+    // If exact fails (device really has only one camera) fall back to
+    // ideal rather than killing the preview.
+    const constraintsFor = (mode, strict) => ({
+      video: {
+        facingMode: strict ? { exact: mode } : { ideal: mode },
+        width: { ideal: IDEAL_VIDEO_WIDTH },
+        height: { ideal: IDEAL_VIDEO_HEIGHT },
+        aspectRatio: { ideal: FRAME_ASPECT },
+      },
+      audio: false,
+    });
+
+    let stream = null;
+    let usedFallback = false;
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: facing,
-          width: { ideal: IDEAL_VIDEO_WIDTH },
-          height: { ideal: IDEAL_VIDEO_HEIGHT },
-          aspectRatio: { ideal: FRAME_ASPECT },
-        },
-        audio: false,
-      });
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(constraintsFor(facing, true));
+      } catch (strictErr) {
+        if (strictErr?.name === 'OverconstrainedError' || strictErr?.name === 'NotFoundError') {
+          stream = await navigator.mediaDevices.getUserMedia(constraintsFor(facing, false));
+          usedFallback = true;
+        } else {
+          throw strictErr;
+        }
+      }
 
       streamRef.current = stream;
       const video = videoRef.current;
       if (!video) { stream.getTracks().forEach((t) => t.stop()); return; }
 
       video.srcObject = stream;
-      // Wait for real dimensions before allowing capture, otherwise the first
-      // frame can be drawn from a 0x0 video.
+
+      // Assigning srcObject resets readyState, so the old short-circuit
+      // could resolve against the PREVIOUS stream's dimensions and then
+      // capture a 0x0 or stale frame. Wait on events, then confirm real
+      // dimensions, with a timeout so a stalled device cannot hang the UI.
       await new Promise((resolve) => {
-        if (video.readyState >= 2 && video.videoWidth) return resolve();
-        video.onloadedmetadata = () => resolve();
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          video.removeEventListener('loadedmetadata', finish);
+          video.removeEventListener('canplay', finish);
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(finish, 4000);
+        video.addEventListener('loadedmetadata', finish);
+        video.addEventListener('canplay', finish);
       });
+
       try { await video.play(); } catch { /* muted + playsInline satisfies autoplay */ }
+
+      // Belt and braces: some browsers fire canplay a beat before
+      // videoWidth is populated.
+      const deadline = Date.now() + 2000;
+      while (!video.videoWidth && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 40));
+      }
+
+      facingRef.current = facing;
       setCameraReady(true);
+
+      // The device only has one camera; say so instead of leaving the
+      // user tapping a button that silently does nothing.
+      if (usedFallback) {
+        const actual = stream.getVideoTracks()[0]?.getSettings?.()?.facingMode;
+        if (actual && actual !== facing) {
+          setCameraNotice('This device has only one camera.');
+        }
+      }
+      return true;
     } catch (err) {
       const name = err?.name || '';
       if (name === 'NotAllowedError' || name === 'SecurityError') {
@@ -130,6 +203,7 @@ export default function PhotoBooth() {
       } else {
         setCameraError('The camera could not be started. Please reload and try again.');
       }
+      return false;
     }
   }, [stopCamera]);
 
@@ -139,12 +213,28 @@ export default function PhotoBooth() {
     await startCamera('user');
   }, [startCamera]);
 
+  // Deliberately allowed mid-strip: a user can shoot some frames on the
+  // front camera and some on the back within one strip.
   const flipCamera = useCallback(async () => {
-    if (capturing) return;
-    const next = facingMode === 'user' ? 'environment' : 'user';
+    if (switchingRef.current) return;
+    switchingRef.current = true;
+    setSwitchingCamera(true);
+    setCameraNotice('');
+
+    const previous = facingRef.current;
+    const next = previous === 'user' ? 'environment' : 'user';
     setFacingMode(next);
-    await startCamera(next);
-  }, [capturing, facingMode, startCamera]);
+
+    const ok = await startCamera(next);
+    if (!ok) {
+      // Restore the working camera rather than leaving a dead preview.
+      setFacingMode(previous);
+      await startCamera(previous);
+    }
+
+    switchingRef.current = false;
+    setSwitchingCamera(false);
+  }, [startCamera]);
 
   // ── CAPTURE ──
   // Centre-crops the live frame to exactly FRAME_ASPECT before scaling, so a
@@ -223,7 +313,13 @@ export default function PhotoBooth() {
 
     for (let i = 0; i < PHOTO_COUNT; i++) {
       if (abortRef.current) { setCapturing(false); return; }
-      const dataUrl = capturePhoto(facingMode);
+      // A flip may be in flight; give the new stream a moment rather
+      // than capturing a blank frame mid-swap.
+      if (switchingRef.current) {
+        const deadline = Date.now() + 2500;
+        while (switchingRef.current && Date.now() < deadline) await wait(80);
+      }
+      const dataUrl = capturePhoto(facingRef.current);
       if (dataUrl) captured.push(dataUrl);
       triggerFlash();
       setCapturedDots((prev) => { const n = [...prev]; n[i] = true; return n; });
@@ -248,7 +344,7 @@ export default function PhotoBooth() {
     setScreen('processing');
     await wait(DEVELOPING_MS);
     if (!abortRef.current) setScreen('result');
-  }, [capturing, cameraReady, facingMode, capturePhoto, doCountdown, triggerFlash, stopCamera, wait]);
+  }, [capturing, cameraReady, capturePhoto, doCountdown, triggerFlash, stopCamera, wait]);
 
   // ── STRIP RENDER ──
   // Always settles: a failed or missing image rejects rather than leaving the
@@ -265,7 +361,7 @@ export default function PhotoBooth() {
       const imgH = Math.round(imgW / FRAME_ASPECT);
       const pad = 40;
       const gap = 20;
-      const botPad = 70;
+      const botPad = 92;
 
       canvas.width = imgW + pad * 2;
       canvas.height = pad + (imgH + gap) * PHOTO_COUNT - gap + botPad;
@@ -276,9 +372,13 @@ export default function PhotoBooth() {
       ctx.fillRect(0, 0, W, H);
 
       ctx.fillStyle = BG_TEXT_COLORS[selectedBg] || BG_TEXT_COLORS.white;
-      ctx.font = '700 14px "Courier Prime", monospace';
       ctx.textAlign = 'center';
-      ctx.fillText(getDateString(), W / 2, H - 24);
+
+      ctx.font = '700 15px "Courier Prime", monospace';
+      drawSpacedText(ctx, 'VINTAGE STRIP CLUB', W / 2, H - 58, 3.2);
+
+      ctx.font = '700 13px "Courier Prime", monospace';
+      drawSpacedText(ctx, getDateString().toUpperCase(), W / 2, H - 26, 2.4);
 
       let loaded = 0;
       let failed = false;
@@ -509,7 +609,7 @@ export default function PhotoBooth() {
               <div className="font-[Playfair_Display,serif] font-black text-[1.4rem] tracking-[0.18em] uppercase mt-2" style={{ color: '#3A3A3A' }}>Club</div>
             </div>
 
-            <p className="fade-in fade-in-delay font-[DM_Mono,monospace] text-[0.6rem] tracking-[0.4em] uppercase mb-10" style={{ color: '#3A3A3A' }}>A timeless vestige of physicality in a virtual world</p>
+            <p className="fade-in fade-in-delay font-[DM_Mono,monospace] text-[0.6rem] tracking-[0.4em] uppercase mb-10" style={{ color: '#3A3A3A' }}>Classic four frame photo strips — shipped to you!</p>
 
             <button onClick={handleStart} className="fade-in fade-in-delay-2 inline-flex items-center justify-center w-[140px] h-[140px] rounded-full bg-white font-[Courier_Prime,monospace] font-bold text-lg tracking-[0.2em] uppercase cursor-pointer transition-all active:scale-[0.92]" style={{ color: '#3A3A3A', border: '4px solid rgba(58,58,58,0.1)', boxShadow: '0 0 0 8px rgba(58,58,58,0.06), 0 8px 32px rgba(0,0,0,0.1)' }}>Start</button>
           </div>
@@ -564,6 +664,18 @@ export default function PhotoBooth() {
                 </div>
               )}
 
+              {switchingCamera && (
+                <div className="absolute inset-0 z-25 flex items-center justify-center bg-black/40 backdrop-blur-[2px] pointer-events-none">
+                  <span className="text-[0.6rem] tracking-[0.2em] uppercase text-cream/90">Switching camera…</span>
+                </div>
+              )}
+
+              {cameraNotice && (
+                <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-30 px-3 py-1.5 bg-black/60 rounded-full backdrop-blur-lg pointer-events-none">
+                  <span className="text-[0.55rem] tracking-[0.1em] uppercase text-cream/80">{cameraNotice}</span>
+                </div>
+              )}
+
               <div className={`absolute inset-0 z-30 bg-white pointer-events-none ${flashActive ? 'flash' : 'opacity-0'}`} />
             </div>
 
@@ -575,7 +687,7 @@ export default function PhotoBooth() {
             )}
 
             <div className="absolute bottom-0 left-0 right-0 z-20 px-6 py-6 flex items-center justify-center gap-8" style={{ background: 'linear-gradient(to top, rgba(0,0,0,0.7) 0%, transparent 100%)', paddingBottom: 'max(1.5rem, env(safe-area-inset-bottom))' }}>
-              <button onClick={flipCamera} disabled={capturing} aria-label="Switch camera" className="w-12 h-12 rounded-full bg-white/10 border border-white/25 text-cream flex items-center justify-center backdrop-blur-lg active:scale-90 transition-all disabled:opacity-30 disabled:pointer-events-none">
+              <button onClick={flipCamera} disabled={switchingCamera} aria-label="Switch camera" className="w-12 h-12 rounded-full bg-white/10 border border-white/25 text-cream flex items-center justify-center backdrop-blur-lg active:scale-90 transition-all disabled:opacity-30 disabled:pointer-events-none">
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M1 4v6h6" /><path d="M23 20v-6h-6" /><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15" /></svg>
               </button>
               <button onClick={startCapture} disabled={capturing || !cameraReady} className="w-[76px] h-[76px] rounded-full bg-red border-[3px] border-white/30 text-cream font-[Courier_Prime,monospace] font-bold text-sm tracking-[0.15em] uppercase transition-all active:scale-[0.92] disabled:opacity-40 disabled:pointer-events-none" style={{ boxShadow: '0 0 0 5px rgba(196,58,43,0.2), 0 4px 20px rgba(0,0,0,0.4)' }}>Go</button>
@@ -606,7 +718,8 @@ export default function PhotoBooth() {
             <div
               className="photo-strip flex flex-col gap-[5px] rounded-sm relative -rotate-1"
               data-date={stripDate}
-              style={{ background: BG_COLORS[selectedBg], padding: '10px 10px 26px 10px', boxShadow: '0 8px 40px rgba(0,0,0,0.5), 0 2px 8px rgba(0,0,0,0.3)', '--strip-text-color': BG_TEXT_COLORS[selectedBg] }}
+              data-brand="Vintage Strip Club"
+              style={{ background: BG_COLORS[selectedBg], padding: '10px 10px 34px 10px', boxShadow: '0 8px 40px rgba(0,0,0,0.5), 0 2px 8px rgba(0,0,0,0.3)', '--strip-text-color': BG_TEXT_COLORS[selectedBg] }}
             >
               {photos.map((src, i) => (
                 <img key={i} src={src} alt={`Frame ${i + 1} of ${PHOTO_COUNT}`} className="w-[170px] aspect-[4/3] object-cover block rounded-[1px]" style={{ filter: getFilterCSS(selectedFilter), animation: `fadeIn 0.4s ease-out ${i * 0.1}s forwards`, opacity: 0 }} />
@@ -633,6 +746,7 @@ export default function PhotoBooth() {
             </div>
           </div>
 
+          {Object.keys(BG_COLORS).length > 1 && (
           <div className="w-full max-w-[360px] mt-3">
             <div className="text-[0.55rem] tracking-[0.15em] uppercase text-cream/40 mb-2 text-center">Strip Background</div>
             <div className="flex gap-2 justify-center">
@@ -641,6 +755,7 @@ export default function PhotoBooth() {
               ))}
             </div>
           </div>
+          )}
         </div>
       )}
 

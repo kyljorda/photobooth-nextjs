@@ -3,7 +3,7 @@ import ErrorBoundary from '@/components/ErrorBoundary';
 
 export const metadata = {
   title: 'Vintage Strip Club',
-  description: 'A timeless vestige of physicality in a virtual world',
+  description: 'Classic four frame photo strips — shipped to you!',
   manifest: '/manifest.json',
   applicationName: 'Vintage Strip Club',
   appleWebApp: {

@@ -1,0 +1,15 @@
+{
+  "name": "vsc-print-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local fulfilment agent: pulls paid orders and prints 2x6 strips on a DNP printer via CUPS.",
+  "scripts": {
+    "start": "node print-agent.js",
+    "dryrun": "node dry-run.js"
+  },
+  "dependencies": {
+    "sharp": "^0.33.5"
+  },
+  "engines": { "node": ">=20" }
+}

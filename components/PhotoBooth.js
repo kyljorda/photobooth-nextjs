@@ -78,6 +78,12 @@ export default function PhotoBooth() {
   // A ref is always current.
   const facingRef = useRef('user');
   const switchingRef = useRef(false);
+  // Both cameras' streams, held open together where the device allows it.
+  const streamsRef = useRef({ user: null, environment: null });
+  // deviceIds resolved once, so re-acquiring skips facingMode lookup.
+  const deviceIdsRef = useRef({ user: null, environment: null });
+  const dualStreamRef = useRef(false);
+  const prewarmDoneRef = useRef(false);
   // Every pending timer is registered here so navigating away or unmounting
   // mid-capture cannot fire a state update on a dead component.
   const timersRef = useRef(new Set());
@@ -99,98 +105,158 @@ export default function PhotoBooth() {
   }), []);
 
   // ── CAMERA ──
+  //
+  // Flips happen against a running countdown, so latency is a feature
+  // requirement, not polish. getUserMedia hardware init costs 300-1000ms
+  // on phones and cannot be sped up — so where the device permits it we
+  // hold BOTH cameras open and a flip becomes a srcObject swap, roughly
+  // one frame. Devices that refuse two simultaneous cameras (iOS usually
+  // does) fall back to acquire-then-swap, which still beats the old path
+  // because the current preview stays live during init instead of going
+  // black.
+
+  const isLive = (stream) => stream?.getVideoTracks?.()[0]?.readyState === 'live';
+
   const stopCamera = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
+    const streams = streamsRef.current;
+    for (const key of ['user', 'environment']) {
+      streams[key]?.getTracks().forEach((t) => t.stop());
+      streams[key] = null;
     }
+    streamRef.current = null;
     setCameraReady(false);
   }, []);
 
+  const acquireStream = useCallback(async (facing) => {
+    const base = {
+      width: { ideal: IDEAL_VIDEO_WIDTH },
+      height: { ideal: IDEAL_VIDEO_HEIGHT },
+      aspectRatio: { ideal: FRAME_ASPECT },
+    };
+    const gum = (video) => navigator.mediaDevices.getUserMedia({ video, audio: false });
+
+    // Fastest path: a known deviceId lets the browser skip resolving
+    // facingMode against the device list.
+    const cachedId = deviceIdsRef.current[facing];
+    if (cachedId) {
+      try { return await gum({ deviceId: { exact: cachedId }, ...base }); } catch { /* fall through */ }
+    }
+
+    try {
+      return await gum({ facingMode: { exact: facing }, ...base });
+    } catch (err) {
+      if (err?.name === 'OverconstrainedError' || err?.name === 'NotFoundError') {
+        return await gum({ facingMode: { ideal: facing }, ...base });
+      }
+      throw err;
+    }
+  }, []);
+
+  const attachStream = useCallback(async (stream, facing) => {
+    const video = videoRef.current;
+    if (!video) return false;
+
+    video.srcObject = stream;
+
+    // loadedmetadata is the earliest moment dimensions exist. The old
+    // code also waited on canplay, which fires later and bought nothing.
+    await new Promise((resolve) => {
+      if (video.videoWidth) return resolve();
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        video.removeEventListener('loadedmetadata', finish);
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(finish, 3000);
+      video.addEventListener('loadedmetadata', finish);
+    });
+
+    try { await video.play(); } catch { /* muted + playsInline satisfies autoplay */ }
+
+    // Poll at frame cadence rather than the old 40ms, so readiness is
+    // detected as soon as it happens.
+    const deadline = Date.now() + 1500;
+    while (!video.videoWidth && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 16));
+    }
+
+    streamRef.current = stream;
+    streamsRef.current[facing] = stream;
+    facingRef.current = facing;
+    setFacingMode(facing);
+    setCameraReady(true);
+    return true;
+  }, []);
+
+  const cacheDeviceIds = useCallback(async () => {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      // Labels only populate after permission is granted, which is why
+      // this runs after the first successful getUserMedia.
+      for (const cam of devices.filter((d) => d.kind === 'videoinput')) {
+        const label = (cam.label || '').toLowerCase();
+        if (!deviceIdsRef.current.environment && /back|rear|environment/.test(label)) {
+          deviceIdsRef.current.environment = cam.deviceId;
+        }
+        if (!deviceIdsRef.current.user && /front|face|user/.test(label)) {
+          deviceIdsRef.current.user = cam.deviceId;
+        }
+      }
+    } catch { /* non-fatal: we just lose the deviceId shortcut */ }
+  }, []);
+
+  const prewarmOtherCamera = useCallback(async (primaryFacing) => {
+    if (prewarmDoneRef.current) return;
+    prewarmDoneRef.current = true;
+
+    const other = primaryFacing === 'user' ? 'environment' : 'user';
+    try {
+      const stream = await acquireStream(other);
+
+      // Many phones shut the first camera down when a second opens. If
+      // that happened, two-stream mode is impossible here: discard it and
+      // restore the camera the user is actually looking at.
+      if (!isLive(streamsRef.current[primaryFacing])) {
+        stream.getTracks().forEach((t) => t.stop());
+        dualStreamRef.current = false;
+        const restored = await acquireStream(primaryFacing);
+        await attachStream(restored, primaryFacing);
+        return;
+      }
+
+      streamsRef.current[other] = stream;
+      dualStreamRef.current = true;
+    } catch {
+      dualStreamRef.current = false;
+    }
+  }, [acquireStream, attachStream]);
+
   const startCamera = useCallback(async (facing) => {
-    stopCamera();
     setCameraError('');
 
     if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
       setCameraError('This browser does not support camera access. Try Safari or Chrome.');
-      return;
+      return false;
     }
 
-    // `exact` genuinely forces the requested camera. With a plain
-    // facingMode string many phones simply hand back the front camera
-    // again — which is why the flip button appeared to do nothing.
-    // If exact fails (device really has only one camera) fall back to
-    // ideal rather than killing the preview.
-    const constraintsFor = (mode, strict) => ({
-      video: {
-        facingMode: strict ? { exact: mode } : { ideal: mode },
-        width: { ideal: IDEAL_VIDEO_WIDTH },
-        height: { ideal: IDEAL_VIDEO_HEIGHT },
-        aspectRatio: { ideal: FRAME_ASPECT },
-      },
-      audio: false,
-    });
-
-    let stream = null;
-    let usedFallback = false;
-
     try {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia(constraintsFor(facing, true));
-      } catch (strictErr) {
-        if (strictErr?.name === 'OverconstrainedError' || strictErr?.name === 'NotFoundError') {
-          stream = await navigator.mediaDevices.getUserMedia(constraintsFor(facing, false));
-          usedFallback = true;
-        } else {
-          throw strictErr;
-        }
+      const stream = await acquireStream(facing);
+      const attached = await attachStream(stream, facing);
+      if (!attached) { stream.getTracks().forEach((t) => t.stop()); return false; }
+
+      const actual = stream.getVideoTracks()[0]?.getSettings?.()?.facingMode;
+      if (actual && actual !== facing) {
+        setCameraNotice('This device has only one camera.');
       }
 
-      streamRef.current = stream;
-      const video = videoRef.current;
-      if (!video) { stream.getTracks().forEach((t) => t.stop()); return; }
-
-      video.srcObject = stream;
-
-      // Assigning srcObject resets readyState, so the old short-circuit
-      // could resolve against the PREVIOUS stream's dimensions and then
-      // capture a 0x0 or stale frame. Wait on events, then confirm real
-      // dimensions, with a timeout so a stalled device cannot hang the UI.
-      await new Promise((resolve) => {
-        let settled = false;
-        const finish = () => {
-          if (settled) return;
-          settled = true;
-          video.removeEventListener('loadedmetadata', finish);
-          video.removeEventListener('canplay', finish);
-          clearTimeout(timer);
-          resolve();
-        };
-        const timer = setTimeout(finish, 4000);
-        video.addEventListener('loadedmetadata', finish);
-        video.addEventListener('canplay', finish);
-      });
-
-      try { await video.play(); } catch { /* muted + playsInline satisfies autoplay */ }
-
-      // Belt and braces: some browsers fire canplay a beat before
-      // videoWidth is populated.
-      const deadline = Date.now() + 2000;
-      while (!video.videoWidth && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 40));
-      }
-
-      facingRef.current = facing;
-      setCameraReady(true);
-
-      // The device only has one camera; say so instead of leaving the
-      // user tapping a button that silently does nothing.
-      if (usedFallback) {
-        const actual = stream.getVideoTracks()[0]?.getSettings?.()?.facingMode;
-        if (actual && actual !== facing) {
-          setCameraNotice('This device has only one camera.');
-        }
-      }
+      cacheDeviceIds();
+      // Open the other camera in the background so the first flip is
+      // instant. Deliberately fire-and-forget, and only while the user is
+      // still framing — never mid-capture.
+      prewarmOtherCamera(facing);
       return true;
     } catch (err) {
       const name = err?.name || '';
@@ -205,13 +271,67 @@ export default function PhotoBooth() {
       }
       return false;
     }
-  }, [stopCamera]);
+  }, [acquireStream, attachStream, cacheDeviceIds, prewarmOtherCamera]);
 
   const handleStart = useCallback(async () => {
     abortRef.current = false;
+    prewarmDoneRef.current = false;
     setScreen('camera');
     await startCamera('user');
   }, [startCamera]);
+
+  // Deliberately allowed mid-strip: a user can shoot some frames on the
+  // front camera and some on the back within one strip.
+  const flipCamera = useCallback(async () => {
+    if (switchingRef.current) return;
+
+    const previous = facingRef.current;
+    const next = previous === 'user' ? 'environment' : 'user';
+
+    // FAST PATH — the other camera is already open. One assignment.
+    const cached = streamsRef.current[next];
+    if (isLive(cached)) {
+      const video = videoRef.current;
+      if (video) {
+        video.srcObject = cached;
+        streamRef.current = cached;
+        facingRef.current = next;
+        setFacingMode(next);
+        video.play().catch(() => {});
+        return;
+      }
+    }
+
+    // SLOW PATH — acquire first, swap second, stop the old stream last,
+    // so the live preview keeps running throughout instead of blacking out.
+    switchingRef.current = true;
+    setCameraNotice('');
+    // Only show the overlay if this is actually slow enough to notice;
+    // otherwise it just flashes.
+    const spinner = setTimeout(() => setSwitchingCamera(true), 180);
+
+    try {
+      const stream = await acquireStream(next);
+      const old = streamsRef.current[previous];
+      await attachStream(stream, next);
+      if (old && old !== stream) {
+        old.getTracks().forEach((t) => t.stop());
+        streamsRef.current[previous] = null;
+      }
+    } catch {
+      facingRef.current = previous;
+      setFacingMode(previous);
+      if (isLive(streamsRef.current[previous])) {
+        setCameraNotice('This device has only one camera.');
+      } else {
+        await startCamera(previous);
+      }
+    } finally {
+      clearTimeout(spinner);
+      setSwitchingCamera(false);
+      switchingRef.current = false;
+    }
+  }, [acquireStream, attachStream, startCamera]);
 
   // Deliberately allowed mid-strip: a user can shoot some frames on the
   // front camera and some on the back within one strip.
@@ -547,6 +667,7 @@ export default function PhotoBooth() {
     setCapturedDots(EMPTY_DOTS); setPhotoCount(0);
     setSubmitError('');
     abortRef.current = false;
+    prewarmDoneRef.current = false;
     setScreen('camera');
     await startCamera(facingMode);
   }, [facingMode, startCamera]);
@@ -573,7 +694,8 @@ export default function PhotoBooth() {
     abortRef.current = true;
     timersRef.current.forEach(clearTimeout);
     timersRef.current.clear();
-    if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+    const streams = streamsRef.current;
+    for (const key of ['user', 'environment']) streams[key]?.getTracks().forEach((t) => t.stop());
     // Abandon any in-flight upload rather than leaking the request.
     uploadAbortRef.current?.abort();
   }, []);
@@ -609,7 +731,7 @@ export default function PhotoBooth() {
               <div className="font-[Playfair_Display,serif] font-black text-[1.4rem] tracking-[0.18em] uppercase mt-2" style={{ color: '#3A3A3A' }}>Club</div>
             </div>
 
-            <p className="fade-in fade-in-delay font-[DM_Mono,monospace] text-[0.6rem] tracking-[0.4em] uppercase mb-10" style={{ color: '#3A3A3A' }}>Classic four frame photo strips — shipped to you!</p>
+            <p className="fade-in fade-in-delay font-[DM_Mono,monospace] text-[0.6rem] tracking-[0.4em] uppercase mb-10 leading-[2.1]" style={{ color: '#3A3A3A' }}>Classic four frame photo strips<br />Shipped to you fast</p>
 
             <button onClick={handleStart} className="fade-in fade-in-delay-2 inline-flex items-center justify-center w-[140px] h-[140px] rounded-full bg-white font-[Courier_Prime,monospace] font-bold text-lg tracking-[0.2em] uppercase cursor-pointer transition-all active:scale-[0.92]" style={{ color: '#3A3A3A', border: '4px solid rgba(58,58,58,0.1)', boxShadow: '0 0 0 8px rgba(58,58,58,0.06), 0 8px 32px rgba(0,0,0,0.1)' }}>Start</button>
           </div>

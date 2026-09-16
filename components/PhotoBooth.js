@@ -282,6 +282,8 @@ export default function PhotoBooth() {
 
   // Deliberately allowed mid-strip: a user can shoot some frames on the
   // front camera and some on the back within one strip.
+  // Deliberately allowed mid-strip: a user can shoot some frames on the
+  // front camera and some on the back within one strip.
   const flipCamera = useCallback(async () => {
     if (switchingRef.current) return;
 
@@ -332,29 +334,6 @@ export default function PhotoBooth() {
       switchingRef.current = false;
     }
   }, [acquireStream, attachStream, startCamera]);
-
-  // Deliberately allowed mid-strip: a user can shoot some frames on the
-  // front camera and some on the back within one strip.
-  const flipCamera = useCallback(async () => {
-    if (switchingRef.current) return;
-    switchingRef.current = true;
-    setSwitchingCamera(true);
-    setCameraNotice('');
-
-    const previous = facingRef.current;
-    const next = previous === 'user' ? 'environment' : 'user';
-    setFacingMode(next);
-
-    const ok = await startCamera(next);
-    if (!ok) {
-      // Restore the working camera rather than leaving a dead preview.
-      setFacingMode(previous);
-      await startCamera(previous);
-    }
-
-    switchingRef.current = false;
-    setSwitchingCamera(false);
-  }, [startCamera]);
 
   // ── CAPTURE ──
   // Centre-crops the live frame to exactly FRAME_ASPECT before scaling, so a

@@ -7,7 +7,7 @@ import {
   UNIT_PRICE, SHIPPING, MAX_QTY, TEST_MODE, BG_COLORS, BG_TEXT_COLORS, US_STATES,
 } from '@/lib/config';
 import { validateOrder, LIMITS } from '@/lib/validation';
-import { uploadOrderAssets } from '@/lib/blob-upload';
+import { uploadOrderAssets, dataUrlToFile } from '@/lib/blob-upload';
 
 const EMPTY_DOTS = Array(PHOTO_COUNT).fill(false);
 const STRIP_LETTERS = ['S', 'T', 'R', 'I', 'P'];
@@ -25,14 +25,18 @@ function getDateString(d = new Date()) {
 
 // Canvas has no reliable letter-spacing across browsers (ctx.letterSpacing
 // is recent and unsupported on older Safari), so space glyphs manually.
-function drawSpacedText(ctx, text, centerX, y, spacing) {
+function drawSpacedText(ctx, text, centerX, y, spacing, embolden = false) {
   const chars = [...text];
   const widths = chars.map((c) => ctx.measureText(c).width);
   const total = widths.reduce((a, b) => a + b, 0) + spacing * (chars.length - 1);
   const prevAlign = ctx.textAlign;
   ctx.textAlign = 'left';
   let x = centerX - total / 2;
-  chars.forEach((c, i) => { ctx.fillText(c, x, y); x += widths[i] + spacing; });
+  chars.forEach((c, i) => {
+    ctx.fillText(c, x, y);
+    if (embolden) ctx.strokeText(c, x, y);
+    x += widths[i] + spacing;
+  });
   ctx.textAlign = prevAlign;
 }
 
@@ -56,6 +60,11 @@ export default function PhotoBooth() {
   const [capturing, setCapturing] = useState(false);
   const [countdownNum, setCountdownNum] = useState(null);
   const [flashActive, setFlashActive] = useState(false);
+  // 'off' | 'on'. Two mechanisms hide behind this: a real LED torch on
+  // hardware that exposes one, and a bright screen otherwise.
+  const [flashMode, setFlashMode] = useState('off');
+  const [screenFlashOn, setScreenFlashOn] = useState(false);
+  const [torchAvailable, setTorchAvailable] = useState(false);
   const [switchingCamera, setSwitchingCamera] = useState(false);
   const [cameraNotice, setCameraNotice] = useState('');
   const [capturedDots, setCapturedDots] = useState(EMPTY_DOTS);
@@ -67,6 +76,7 @@ export default function PhotoBooth() {
   const [orderId, setOrderId] = useState('');
   const [uploadProgress, setUploadProgress] = useState(null);
   const [saveNotice, setSaveNotice] = useState('');
+  const [saveImage, setSaveImage] = useState('');
   const [form, setForm] = useState(EMPTY_FORM);
   const [giftForm, setGiftForm] = useState(EMPTY_GIFT);
   const [errors, setErrors] = useState({});
@@ -131,7 +141,32 @@ export default function PhotoBooth() {
 
   const isLive = (stream) => stream?.getVideoTracks?.()[0]?.readyState === 'live';
 
+  // Hardware torch, where it exists. Chrome on Android exposes this on
+  // the rear camera; Safari/iOS does not implement it at all, and no
+  // front camera has an LED. Those cases fall back to screen flash.
+  const trackSupportsTorch = (stream) => {
+    try {
+      return stream?.getVideoTracks?.()[0]?.getCapabilities?.()?.torch === true;
+    } catch { return false; }
+  };
+
+  const setTorch = useCallback(async (on) => {
+    const track = streamRef.current?.getVideoTracks?.()[0];
+    if (!track?.getCapabilities?.()?.torch) return false;
+    try {
+      await track.applyConstraints({ advanced: [{ torch: on }] });
+      return true;
+    } catch { return false; }
+  }, []);
+
   const stopCamera = useCallback(() => {
+    // Stopping a track extinguishes its torch, but be explicit: a torch
+    // left on is a hot lens and a flat battery.
+    const active = streamRef.current?.getVideoTracks?.()[0];
+    if (active?.getCapabilities?.()?.torch) {
+      try { active.applyConstraints({ advanced: [{ torch: false }] }); } catch { /* track may already be ending */ }
+    }
+    setScreenFlashOn(false);
     const streams = streamsRef.current;
     for (const key of ['user', 'environment']) {
       streams[key]?.getTracks().forEach((t) => t.stop());
@@ -201,6 +236,7 @@ export default function PhotoBooth() {
     streamsRef.current[facing] = stream;
     facingRef.current = facing;
     setFacingMode(facing);
+    setTorchAvailable(trackSupportsTorch(stream));
     setCameraReady(true);
     return true;
   }, []);
@@ -276,6 +312,10 @@ export default function PhotoBooth() {
     const previous = facingRef.current;
     const next = previous === 'user' ? 'environment' : 'user';
 
+    // In dual-stream mode the previous stream stays open, so its torch
+    // would keep burning behind the scenes.
+    await setTorch(false);
+
     // FAST PATH — the other camera is already open from an earlier flip.
     // No getUserMedia, so no permission indicator and no hardware init:
     // this is a single assignment and lands within a frame.
@@ -331,7 +371,7 @@ export default function PhotoBooth() {
       setSwitchingCamera(false);
       switchingRef.current = false;
     }
-  }, [acquireStream, attachStream, startCamera]);
+  }, [acquireStream, attachStream, startCamera, setTorch]);
 
   // ── CAPTURE ──
   // Centre-crops the live frame to exactly FRAME_ASPECT before scaling, so a
@@ -392,6 +432,25 @@ export default function PhotoBooth() {
     setCountdownNum(null);
   }, [wait]);
 
+  // Illuminate before capture. A torch needs a moment to reach full
+  // output; a screen flash needs longer still, because auto-exposure has
+  // to settle or the frame comes out blown out or still dark.
+  const beginIllumination = useCallback(async () => {
+    if (flashMode !== 'on') return null;
+    if (await setTorch(true)) {
+      await wait(140);
+      return 'torch';
+    }
+    setScreenFlashOn(true);
+    await wait(280);
+    return 'screen';
+  }, [flashMode, setTorch, wait]);
+
+  const endIllumination = useCallback(async (kind) => {
+    if (kind === 'torch') await setTorch(false);
+    else if (kind === 'screen') setScreenFlashOn(false);
+  }, [setTorch]);
+
   const triggerFlash = useCallback(() => {
     setFlashActive(true);
     const id = setTimeout(() => { timersRef.current.delete(id); setFlashActive(false); }, 350);
@@ -416,9 +475,13 @@ export default function PhotoBooth() {
         const deadline = Date.now() + 2500;
         while (switchingRef.current && Date.now() < deadline) await wait(80);
       }
+      const illumination = await beginIllumination();
       const dataUrl = capturePhoto(facingRef.current);
+      await endIllumination(illumination);
       if (dataUrl) captured.push(dataUrl);
-      triggerFlash();
+      // The screen was already white; a second white flash just reads as
+      // a stutter.
+      if (illumination !== 'screen') triggerFlash();
       setCapturedDots((prev) => { const n = [...prev]; n[i] = true; return n; });
       setPhotoCount(i + 1);
       if (i < PHOTO_COUNT - 1) await doCountdown(COUNTDOWN_SECONDS);
@@ -442,7 +505,7 @@ export default function PhotoBooth() {
     setScreen('processing');
     await wait(DEVELOPING_MS);
     if (!abortRef.current) setScreen('result');
-  }, [capturing, cameraReady, capturePhoto, doCountdown, triggerFlash, stopCamera, wait]);
+  }, [capturing, cameraReady, capturePhoto, doCountdown, triggerFlash, beginIllumination, endIllumination, stopCamera, wait]);
 
   // ── STRIP RENDER ──
   // Always settles: a failed or missing image rejects rather than leaving the
@@ -477,8 +540,13 @@ export default function PhotoBooth() {
       ctx.fillStyle = BG_TEXT_COLORS[selectedBg] || BG_TEXT_COLORS.white;
       ctx.textAlign = 'center';
 
+      // Courier Prime tops out at 700, so a hairline stroke in the same
+      // colour is what makes this read heavier than the date below it.
       ctx.font = '700 15px "Courier Prime", monospace';
-      drawSpacedText(ctx, 'VINTAGE STRIP CLUB', W / 2, H - 58, 3.2);
+      ctx.strokeStyle = ctx.fillStyle;
+      ctx.lineWidth = 0.45;
+      ctx.lineJoin = 'round';
+      drawSpacedText(ctx, 'VINTAGESTRIP.CLUB', W / 2, H - 58, 3.2, true);
 
       ctx.font = '700 13px "Courier Prime", monospace';
       drawSpacedText(ctx, getDateString().toUpperCase(), W / 2, H - 26, 2.4);
@@ -530,9 +598,11 @@ export default function PhotoBooth() {
     setSubmitError('');
     try {
       const dataUrl = await generateStripCanvas();
-      const blob = await (await fetch(dataUrl)).blob();
       const filename = `vintage-strip-club-${Date.now()}.jpg`;
-      const file = new File([blob], filename, { type: 'image/jpeg' });
+      // Decoded in-process. fetch() on a data: URL is subject to
+      // connect-src and our CSP refuses it — that was the failure.
+      const file = dataUrlToFile(dataUrl, filename);
+      const blob = file;
 
       // iOS Safari ignores the <a download> attribute entirely, which is
       // why this button did nothing on a phone. The share sheet is the
@@ -543,18 +613,29 @@ export default function PhotoBooth() {
       }
 
       // Desktop browsers: a real object-URL download.
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 10_000);
-      setSaveNotice('Saved to your downloads');
+      const supportsDownload = 'download' in document.createElement('a');
+      if (supportsDownload) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10_000);
+        setSaveNotice('Saved to your downloads');
+        return;
+      }
+
+      // Last resort (older iOS with no share API): show the image so it
+      // can be saved with a long press.
+      setSaveImage(dataUrl);
     } catch (err) {
       // Dismissing the share sheet is a choice, not a failure.
-      if (err?.name === 'AbortError') return;
+      if (err?.name === 'AbortError' || err?.name === 'NotAllowedError') return;
+      // Logged so a future failure is diagnosable from the console
+      // instead of guessed at. Contains no customer data.
+      console.error('Save failed:', err?.name, err?.message);
       setSubmitError('Could not save your strip. Please try again.');
     }
   }, [generateStripCanvas]);
@@ -689,6 +770,7 @@ export default function PhotoBooth() {
     setOrderQty(1); setGiftMode(false);
     setForm(EMPTY_FORM); setGiftForm(EMPTY_GIFT);
     setErrors({}); setSubmitError(''); setOrderId('');
+    setFlashMode('off');
     setScreen('landing');
   }, [leaveCapture]);
 
@@ -770,6 +852,21 @@ export default function PhotoBooth() {
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true"><path d="M15 18l-6-6 6-6" /></svg>
           </button>
 
+          <button
+            onClick={() => setFlashMode((m) => (m === 'on' ? 'off' : 'on'))}
+            aria-label={flashMode === 'on' ? 'Turn flash off' : 'Turn flash on'}
+            aria-pressed={flashMode === 'on'}
+            className={`absolute top-[max(1rem,env(safe-area-inset-top))] right-4 z-40 w-9 h-9 rounded-full border flex items-center justify-center backdrop-blur-lg active:scale-90 transition-all ${
+              flashMode === 'on'
+                ? 'bg-mint border-mint text-charcoal'
+                : 'bg-white/10 border-white/25 text-cream'
+            }`}
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill={flashMode === 'on' ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2" strokeLinejoin="round" aria-hidden="true">
+              <path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z" />
+            </svg>
+          </button>
+
           <div className="relative flex-1 flex items-center justify-center overflow-hidden">
             {/* The preview is constrained to the same 4:3 box we capture, so what
                 is framed on screen is exactly what lands on the strip. */}
@@ -823,6 +920,12 @@ export default function PhotoBooth() {
                 </div>
               )}
 
+              {flashMode === 'on' && !torchAvailable && (
+                <div className="absolute top-3 right-3 z-30 px-2.5 py-1 bg-black/55 rounded-full backdrop-blur-lg pointer-events-none">
+                  <span className="text-[0.5rem] tracking-[0.1em] uppercase text-cream/75">Screen flash</span>
+                </div>
+              )}
+
               {cameraNotice && (
                 <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-30 px-3 py-1.5 bg-black/60 rounded-full backdrop-blur-lg pointer-events-none">
                   <span className="text-[0.55rem] tracking-[0.1em] uppercase text-cream/80">{cameraNotice}</span>
@@ -830,6 +933,12 @@ export default function PhotoBooth() {
               )}
 
               <div className={`absolute inset-0 z-30 bg-white pointer-events-none ${flashActive ? 'flash' : 'opacity-0'}`} />
+
+              {/* Screen flash: the panel itself is the light source, so it
+                  covers the whole viewport rather than just the preview. */}
+              {screenFlashOn && (
+                <div className="fixed inset-0 z-[60] bg-white pointer-events-none" aria-hidden="true" />
+              )}
             </div>
 
             {cameraError && (
@@ -843,7 +952,7 @@ export default function PhotoBooth() {
               <button onClick={flipCamera} disabled={switchingCamera} aria-label="Switch camera" className="w-12 h-12 rounded-full bg-white/10 border border-white/25 text-cream flex items-center justify-center backdrop-blur-lg active:scale-90 transition-all disabled:opacity-30 disabled:pointer-events-none">
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M1 4v6h6" /><path d="M23 20v-6h-6" /><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15" /></svg>
               </button>
-              <button onClick={startCapture} disabled={capturing || !cameraReady} className="w-[76px] h-[76px] rounded-full bg-red border-[3px] border-white/30 text-cream font-[Courier_Prime,monospace] font-bold text-sm tracking-[0.15em] uppercase transition-all active:scale-[0.92] disabled:opacity-40 disabled:pointer-events-none" style={{ boxShadow: '0 0 0 5px rgba(196,58,43,0.2), 0 4px 20px rgba(0,0,0,0.4)' }}>Go</button>
+              <button onClick={startCapture} disabled={capturing || !cameraReady} className="w-[76px] h-[76px] rounded-full bg-mint border-[3px] border-white/30 text-charcoal font-[Courier_Prime,monospace] font-bold text-sm tracking-[0.15em] uppercase transition-all active:scale-[0.92] disabled:opacity-40 disabled:pointer-events-none" style={{ boxShadow: '0 0 0 5px rgba(206,252,233,0.2), 0 4px 20px rgba(0,0,0,0.4)' }}>Go</button>
               <div className="w-12 h-12 flex items-center justify-center font-medium text-[0.7rem] text-cream/50 tracking-wider" aria-live="polite">{photoCount} / {PHOTO_COUNT}</div>
             </div>
           </div>
@@ -855,7 +964,7 @@ export default function PhotoBooth() {
         <div className="min-h-dvh flex flex-col items-center justify-center bg-dark">
           <div className="text-center">
             <div className="w-10 h-[100px] bg-cream rounded-sm mx-auto mb-8 process-bob" style={{ boxShadow: '0 4px 20px rgba(0,0,0,0.3)' }} />
-            <div className="text-[0.65rem] tracking-[0.3em] uppercase text-gold">Developing your strip…</div>
+            <div className="text-[0.65rem] tracking-[0.3em] uppercase text-mint">Developing your strip…</div>
           </div>
         </div>
       )}
@@ -871,7 +980,7 @@ export default function PhotoBooth() {
             <div
               className="photo-strip flex flex-col gap-[5px] rounded-sm relative -rotate-1"
               data-date={stripDate}
-              data-brand="Vintage Strip Club"
+              data-brand="vintagestrip.club"
               style={{ background: BG_COLORS[selectedBg], padding: '10px 10px 34px 10px', boxShadow: '0 8px 40px rgba(0,0,0,0.5), 0 2px 8px rgba(0,0,0,0.3)', '--strip-text-color': BG_TEXT_COLORS[selectedBg] }}
             >
               {photos.map((src, i) => (
@@ -885,15 +994,15 @@ export default function PhotoBooth() {
 
           <div className="flex gap-2.5 mt-3 w-full max-w-[360px]">
             <button onClick={retake} className="flex-1 py-3.5 px-2 rounded-md font-[DM_Mono,monospace] text-[0.6rem] font-medium tracking-[0.08em] uppercase text-cream border border-cream/15 bg-transparent active:scale-[0.96] transition-all">Retake</button>
-            <button onClick={saveStrip} className="flex-1 py-3.5 px-2 rounded-md font-[DM_Mono,monospace] text-[0.6rem] font-medium tracking-[0.08em] uppercase text-gold border border-gold/30 bg-transparent active:scale-[0.96] transition-all">Save</button>
-            <button onClick={goToOrder} className="flex-1 py-3.5 px-2 rounded-md font-[DM_Mono,monospace] text-[0.6rem] font-medium tracking-[0.08em] uppercase text-cream bg-red border-none active:scale-[0.96] transition-all">Ship It</button>
+            <button onClick={saveStrip} className="flex-1 py-3.5 px-2 rounded-md font-[DM_Mono,monospace] text-[0.6rem] font-medium tracking-[0.08em] uppercase text-mint border border-mint/40 bg-transparent active:scale-[0.96] transition-all">Save</button>
+            <button onClick={goToOrder} className="flex-1 py-3.5 px-2 rounded-md font-[DM_Mono,monospace] text-[0.6rem] font-medium tracking-[0.08em] uppercase text-charcoal bg-mint border-none active:scale-[0.96] transition-all">Ship It</button>
           </div>
 
           <div className="w-full max-w-[360px] mt-3">
             <div className="text-[0.55rem] tracking-[0.15em] uppercase text-cream/40 mb-2 text-center">Photo Style</div>
             <div className="flex gap-2 justify-center">
               {['original', 'bw', 'sepia'].map((f) => (
-                <button key={f} onClick={() => { setSelectedFilter(f); uploadCacheRef.current = null; }} aria-pressed={selectedFilter === f} className={`px-3 py-1.5 rounded-full text-[0.55rem] tracking-[0.1em] uppercase transition-all active:scale-[0.94] border ${selectedFilter === f ? 'border-gold text-gold bg-gold/[0.08]' : 'border-cream/10 text-cream/50 bg-transparent'}`}>
+                <button key={f} onClick={() => { setSelectedFilter(f); uploadCacheRef.current = null; }} aria-pressed={selectedFilter === f} className={`px-3 py-1.5 rounded-full text-[0.55rem] tracking-[0.1em] uppercase transition-all active:scale-[0.94] border ${selectedFilter === f ? 'border-mint text-mint bg-mint/[0.08]' : 'border-cream/10 text-cream/50 bg-transparent'}`}>
                   {f === 'bw' ? 'B&W' : f.charAt(0).toUpperCase() + f.slice(1)}
                 </button>
               ))}
@@ -905,11 +1014,21 @@ export default function PhotoBooth() {
             <div className="text-[0.55rem] tracking-[0.15em] uppercase text-cream/40 mb-2 text-center">Strip Background</div>
             <div className="flex gap-2 justify-center">
               {Object.entries(BG_COLORS).map(([key, color]) => (
-                <button key={key} onClick={() => { setSelectedBg(key); uploadCacheRef.current = null; }} aria-label={`${key} background`} aria-pressed={selectedBg === key} className={`w-12 h-12 rounded-lg transition-all active:scale-[0.92] border-2 ${selectedBg === key ? 'border-gold shadow-[0_0_0_2px_rgba(212,168,83,0.3),0_2px_8px_rgba(0,0,0,0.3)]' : 'border-cream/10'}`} style={{ background: color }} />
+                <button key={key} onClick={() => { setSelectedBg(key); uploadCacheRef.current = null; }} aria-label={`${key} background`} aria-pressed={selectedBg === key} className={`w-12 h-12 rounded-lg transition-all active:scale-[0.92] border-2 ${selectedBg === key ? 'border-mint shadow-[0_0_0_2px_rgba(206,252,233,0.3),0_2px_8px_rgba(0,0,0,0.3)]' : 'border-cream/10'}`} style={{ background: color }} />
               ))}
             </div>
           </div>
           )}
+        </div>
+      )}
+
+      {/* Long-press save fallback for browsers with neither the share
+          sheet nor download support. */}
+      {saveImage && (
+        <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/90 p-6" role="dialog" aria-modal="true">
+          <p className="text-[0.65rem] tracking-[0.1em] uppercase text-cream/80 mb-4 text-center">Press and hold the strip, then choose Save Image</p>
+          <img src={saveImage} alt="Your photo strip" className="max-h-[70vh] w-auto rounded-sm" />
+          <button onClick={() => setSaveImage('')} className="mt-6 py-3 px-8 rounded-md border border-cream/20 text-cream text-[0.65rem] tracking-[0.1em] uppercase active:scale-95">Done</button>
         </div>
       )}
 
@@ -924,8 +1043,8 @@ export default function PhotoBooth() {
           </div>
 
           {TEST_MODE && (
-            <div className="mb-5 px-4 py-3 rounded-lg border border-gold/30 bg-gold/[0.07]">
-              <p className="text-[0.62rem] text-gold leading-relaxed">
+            <div className="mb-5 px-4 py-3 rounded-lg border border-mint/30 bg-mint/[0.07]">
+              <p className="text-[0.62rem] text-mint leading-relaxed">
                 Preview mode — payments are not live yet. Submitting this form does not charge you, and no strip will be printed or shipped.
               </p>
             </div>
@@ -944,7 +1063,7 @@ export default function PhotoBooth() {
             <div className="flex-1">
               <div className="font-[Courier_Prime,monospace] font-bold text-sm tracking-wider mb-1">Printed Photo Strip</div>
               <div className="text-[0.6rem] text-cream/50 leading-relaxed mb-2">Glossy {PHOTO_COUNT}-frame strip on premium cardstock. Mailed in a rigid mailer.</div>
-              <div className="font-[Playfair_Display,serif] font-bold text-lg text-gold">{formatCents(UNIT_PRICE)} <span className="font-[DM_Mono,monospace] text-[0.55rem] font-normal text-cream/40">each</span></div>
+              <div className="font-[Playfair_Display,serif] font-bold text-lg text-mint">{formatCents(UNIT_PRICE)} <span className="font-[DM_Mono,monospace] text-[0.55rem] font-normal text-cream/40">each</span></div>
               <div className="flex items-center gap-2.5 mt-2.5">
                 <button onClick={() => setOrderQty((q) => Math.max(1, q - 1))} disabled={orderQty <= 1} aria-label="Decrease quantity" className="w-[30px] h-[30px] rounded-full bg-cream/[0.06] border border-cream/15 text-cream text-base flex items-center justify-center active:scale-90 disabled:opacity-25 disabled:pointer-events-none transition-all">−</button>
                 <span className="font-[Courier_Prime,monospace] font-bold text-sm min-w-[1.5rem] text-center" aria-live="polite">{orderQty}</span>
@@ -970,7 +1089,7 @@ export default function PhotoBooth() {
 
           <label className="flex items-center gap-2.5 mt-1 mb-1 cursor-pointer select-none">
             <input type="checkbox" className="sr-only" checked={giftMode} onChange={(e) => setGiftMode(e.target.checked)} />
-            <span className={`w-5 h-5 rounded flex items-center justify-center transition-all border-[1.5px] ${giftMode ? 'bg-gold border-gold' : 'bg-cream/[0.06] border-cream/15'}`}>
+            <span className={`w-5 h-5 rounded flex items-center justify-center transition-all border-[1.5px] ${giftMode ? 'bg-mint border-mint' : 'bg-cream/[0.06] border-cream/15'}`}>
               {giftMode && <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#1A1714" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12" /></svg>}
             </span>
             <span className="text-[0.65rem] tracking-wider text-cream/60">For someone else?</span>
@@ -1014,16 +1133,16 @@ export default function PhotoBooth() {
           <div className="mb-5">
             <div className="flex justify-between items-center mb-2"><span className="text-[0.65rem] text-cream/50">Photo strip × {orderQty}</span><span className="text-[0.65rem]">{formatCents(orderQty * UNIT_PRICE)}</span></div>
             <div className="flex justify-between items-center mb-2"><span className="text-[0.65rem] text-cream/50">Shipping</span><span className="text-[0.65rem]">{SHIPPING === 0 ? 'Free' : formatCents(SHIPPING)}</span></div>
-            <div className="flex justify-between items-center mt-3 pt-3 border-t border-cream/15"><span className="text-[0.7rem] font-medium text-cream">Total</span><span className="font-[Playfair_Display,serif] font-bold text-base text-gold">{formatCents(total)}</span></div>
+            <div className="flex justify-between items-center mt-3 pt-3 border-t border-cream/15"><span className="text-[0.7rem] font-medium text-cream">Total</span><span className="font-[Playfair_Display,serif] font-bold text-base text-mint">{formatCents(total)}</span></div>
           </div>
 
           {submitError && <p className="text-[0.6rem] text-red mb-3" role="alert">{submitError}</p>}
 
-          <button onClick={() => submitOrder('card')} disabled={submitting} className="w-full py-4 rounded-lg bg-red text-cream font-[Courier_Prime,monospace] font-bold text-sm tracking-[0.15em] uppercase active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none transition-all" style={{ boxShadow: '0 4px 16px rgba(196,58,43,0.25)' }}>
+          <button onClick={() => submitOrder('card')} disabled={submitting} className="w-full py-4 rounded-lg bg-mint text-charcoal font-[Courier_Prime,monospace] font-bold text-sm tracking-[0.15em] uppercase active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none transition-all" style={{ boxShadow: '0 4px 16px rgba(206,252,233,0.22)' }}>
             {submitting
               ? (uploadProgress
                 ? <span>Uploading photos… {uploadProgress.completed}/{uploadProgress.total}</span>
-                : <span className="block w-[18px] h-[18px] border-2 border-white/30 border-t-cream rounded-full mx-auto" style={{ animation: 'spin 0.6s linear infinite' }} />)
+                : <span className="block w-[18px] h-[18px] border-2 border-charcoal/25 border-t-charcoal rounded-full mx-auto" style={{ animation: 'spin 0.6s linear infinite' }} />)
               : <span>{TEST_MODE ? 'Submit Preview Order' : `Place Order — ${formatCents(total)}`}</span>}
           </button>
 
@@ -1046,7 +1165,7 @@ export default function PhotoBooth() {
               ? 'This was a preview submission. You have not been charged and nothing will be shipped. Payments go live once Stripe is connected.'
               : 'Your photo strip is being printed and will ship within 2–3 business days. A confirmation email is on its way.'}
           </p>
-          {orderId && <div className="font-[Courier_Prime,monospace] text-[0.65rem] text-gold tracking-[0.15em] mb-8">Reference {orderId}</div>}
+          {orderId && <div className="font-[Courier_Prime,monospace] text-[0.65rem] text-mint tracking-[0.15em] mb-8">Reference {orderId}</div>}
           <button onClick={startOver} className="py-3.5 px-8 rounded-md bg-transparent border border-cream/15 text-cream font-[DM_Mono,monospace] text-[0.65rem] font-medium tracking-[0.1em] uppercase active:scale-[0.96] transition-all">Take Another Strip</button>
         </div>
       )}
@@ -1058,7 +1177,7 @@ export default function PhotoBooth() {
 function FormSection({ label, children }) {
   return (
     <div className="mb-5">
-      <div className="text-[0.6rem] tracking-[0.2em] uppercase text-gold mb-3 pb-1.5 border-b border-gold/15">{label}</div>
+      <div className="text-[0.6rem] tracking-[0.2em] uppercase text-mint mb-3 pb-1.5 border-b border-mint/15">{label}</div>
       {children}
     </div>
   );
@@ -1084,7 +1203,7 @@ function Input({ value, onChange, error, id, ...props }) {
       value={value}
       onChange={(e) => onChange(e.target.value)}
       aria-invalid={error ? 'true' : undefined}
-      className={`field-input w-full py-2.5 px-3 bg-cream/[0.06] border-[1.5px] rounded-md text-cream font-[DM_Mono,monospace] text-xs outline-none transition-colors ${error ? 'border-red' : 'border-cream/15'} focus:border-gold/40 placeholder:text-cream/20`}
+      className={`field-input w-full py-2.5 px-3 bg-cream/[0.06] border-[1.5px] rounded-md text-cream font-[DM_Mono,monospace] text-xs outline-none transition-colors ${error ? 'border-red' : 'border-cream/15'} focus:border-mint/40 placeholder:text-cream/20`}
       style={{ WebkitUserSelect: 'text', userSelect: 'text' }}
       {...props}
     />
@@ -1098,7 +1217,7 @@ function StateSelect({ value, onChange, error, id }) {
       value={value}
       onChange={(e) => onChange(e.target.value)}
       aria-invalid={error ? 'true' : undefined}
-      className={`field-input w-full py-2.5 px-3 bg-cream/[0.06] border-[1.5px] rounded-md text-cream font-[DM_Mono,monospace] text-xs outline-none transition-colors ${error ? 'border-red' : 'border-cream/15'} focus:border-gold/40`}
+      className={`field-input w-full py-2.5 px-3 bg-cream/[0.06] border-[1.5px] rounded-md text-cream font-[DM_Mono,monospace] text-xs outline-none transition-colors ${error ? 'border-red' : 'border-cream/15'} focus:border-mint/40`}
     >
       <option value="">—</option>
       {US_STATES.map((s) => <option key={s} value={s}>{s}</option>)}

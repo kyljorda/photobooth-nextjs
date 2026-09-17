@@ -121,7 +121,9 @@ export async function renderStrip({ frames, background, filter, dateText, dpi = 
          <text x="${centerX}" y="${brandBaselineY}"
                font-family="Courier New, monospace" font-size="${brandFontPx}"
                font-weight="700" letter-spacing="${brandFontPx * 0.22}"
-               fill="${fg}" text-anchor="middle">VINTAGE STRIP CLUB</text>
+               fill="${fg}" stroke="${fg}" stroke-width="${brandFontPx * 0.03}"
+               stroke-linejoin="round"
+               text-anchor="middle">VINTAGESTRIP.CLUB</text>
          ${dateLine}
        </svg>`
     );

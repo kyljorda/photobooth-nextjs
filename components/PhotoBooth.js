@@ -14,10 +14,13 @@ const STRIP_LETTERS = ['S', 'T', 'R', 'I', 'P'];
 
 function formatCents(c) { return '$' + (c / 100).toFixed(2); }
 
-function getDateString() {
-  return new Date().toLocaleDateString('en-US', {
+function getDateString(d = new Date()) {
+  // en-US renders "September 16, 2026"; the strip reads better without
+  // the comma, and the printed caption is letter-spaced where a comma
+  // sits awkwardly.
+  return d.toLocaleDateString('en-US', {
     month: 'long', day: 'numeric', year: 'numeric',
-  });
+  }).replace(',', '');
 }
 
 // Canvas has no reliable letter-spacing across browsers (ctx.letterSpacing
@@ -63,6 +66,7 @@ export default function PhotoBooth() {
   const [submitError, setSubmitError] = useState('');
   const [orderId, setOrderId] = useState('');
   const [uploadProgress, setUploadProgress] = useState(null);
+  const [saveNotice, setSaveNotice] = useState('');
   const [form, setForm] = useState(EMPTY_FORM);
   const [giftForm, setGiftForm] = useState(EMPTY_GIFT);
   const [errors, setErrors] = useState({});
@@ -82,8 +86,9 @@ export default function PhotoBooth() {
   const streamsRef = useRef({ user: null, environment: null });
   // deviceIds resolved once, so re-acquiring skips facingMode lookup.
   const deviceIdsRef = useRef({ user: null, environment: null });
-  const dualStreamRef = useRef(false);
-  const prewarmDoneRef = useRef(false);
+  // null = not yet known, true = device holds both cameras open,
+  // false = opening one shuts the other down (typical on iOS).
+  const dualStreamRef = useRef(null);
   // Every pending timer is registered here so navigating away or unmounting
   // mid-capture cannot fire a state update on a dead component.
   const timersRef = useRef(new Set());
@@ -93,6 +98,15 @@ export default function PhotoBooth() {
   const uploadCacheRef = useRef(null);
   const uploadSessionRef = useRef(null);
   const uploadAbortRef = useRef(null);
+  // The composed strip, keyed by the inputs that change it. Saving and
+  // submitting both need this render; generating it once also keeps the
+  // Save handler inside the user-gesture window that iOS requires for
+  // the share sheet.
+  const stripRenderRef = useRef({ key: '', dataUrl: null });
+  // Photo count alone cannot key the cache: it is always PHOTO_COUNT, so
+  // a retake would produce an identical key and serve the PREVIOUS
+  // session's strip. This counter makes every capture set distinct.
+  const photoGenRef = useRef(0);
 
   const clearTimers = useCallback(() => {
     timersRef.current.forEach(clearTimeout);
@@ -208,32 +222,6 @@ export default function PhotoBooth() {
     } catch { /* non-fatal: we just lose the deviceId shortcut */ }
   }, []);
 
-  const prewarmOtherCamera = useCallback(async (primaryFacing) => {
-    if (prewarmDoneRef.current) return;
-    prewarmDoneRef.current = true;
-
-    const other = primaryFacing === 'user' ? 'environment' : 'user';
-    try {
-      const stream = await acquireStream(other);
-
-      // Many phones shut the first camera down when a second opens. If
-      // that happened, two-stream mode is impossible here: discard it and
-      // restore the camera the user is actually looking at.
-      if (!isLive(streamsRef.current[primaryFacing])) {
-        stream.getTracks().forEach((t) => t.stop());
-        dualStreamRef.current = false;
-        const restored = await acquireStream(primaryFacing);
-        await attachStream(restored, primaryFacing);
-        return;
-      }
-
-      streamsRef.current[other] = stream;
-      dualStreamRef.current = true;
-    } catch {
-      dualStreamRef.current = false;
-    }
-  }, [acquireStream, attachStream]);
-
   const startCamera = useCallback(async (facing) => {
     setCameraError('');
 
@@ -252,11 +240,9 @@ export default function PhotoBooth() {
         setCameraNotice('This device has only one camera.');
       }
 
+      // enumerateDevices does not touch the camera, so it costs nothing
+      // and never triggers a permission indicator.
       cacheDeviceIds();
-      // Open the other camera in the background so the first flip is
-      // instant. Deliberately fire-and-forget, and only while the user is
-      // still framing — never mid-capture.
-      prewarmOtherCamera(facing);
       return true;
     } catch (err) {
       const name = err?.name || '';
@@ -271,11 +257,11 @@ export default function PhotoBooth() {
       }
       return false;
     }
-  }, [acquireStream, attachStream, cacheDeviceIds, prewarmOtherCamera]);
+  }, [acquireStream, attachStream, cacheDeviceIds]);
 
   const handleStart = useCallback(async () => {
     abortRef.current = false;
-    prewarmDoneRef.current = false;
+    dualStreamRef.current = null;
     setScreen('camera');
     await startCamera('user');
   }, [startCamera]);
@@ -290,7 +276,9 @@ export default function PhotoBooth() {
     const previous = facingRef.current;
     const next = previous === 'user' ? 'environment' : 'user';
 
-    // FAST PATH — the other camera is already open. One assignment.
+    // FAST PATH — the other camera is already open from an earlier flip.
+    // No getUserMedia, so no permission indicator and no hardware init:
+    // this is a single assignment and lands within a frame.
     const cached = streamsRef.current[next];
     if (isLive(cached)) {
       const video = videoRef.current;
@@ -304,20 +292,30 @@ export default function PhotoBooth() {
       }
     }
 
-    // SLOW PATH — acquire first, swap second, stop the old stream last,
-    // so the live preview keeps running throughout instead of blacking out.
+    // SLOW PATH — acquire the new camera while the current preview keeps
+    // running, so there is no black gap during hardware init.
     switchingRef.current = true;
     setCameraNotice('');
-    // Only show the overlay if this is actually slow enough to notice;
-    // otherwise it just flashes.
     const spinner = setTimeout(() => setSwitchingCamera(true), 180);
 
     try {
       const stream = await acquireStream(next);
-      const old = streamsRef.current[previous];
+      const previousStream = streamsRef.current[previous];
+
       await attachStream(stream, next);
-      if (old && old !== stream) {
-        old.getTracks().forEach((t) => t.stop());
+
+      // Discover, once, whether this device tolerates two open cameras.
+      // Doing it here rather than at startup means the cost is paid
+      // during a flip the user asked for, not as a black flash on open.
+      if (dualStreamRef.current === null) {
+        dualStreamRef.current = isLive(previousStream);
+      }
+
+      if (dualStreamRef.current && isLive(previousStream)) {
+        // Keep it open: every later flip becomes the fast path above.
+        streamsRef.current[previous] = previousStream;
+      } else {
+        previousStream?.getTracks().forEach((t) => t.stop());
         streamsRef.current[previous] = null;
       }
     } catch {
@@ -435,6 +433,7 @@ export default function PhotoBooth() {
       return;
     }
 
+    photoGenRef.current += 1;
     photosRef.current = captured;
     setPhotos(captured);
     setCapturing(false);
@@ -449,6 +448,11 @@ export default function PhotoBooth() {
   // Always settles: a failed or missing image rejects rather than leaving the
   // promise — and the submit spinner — pending forever.
   const generateStripCanvas = useCallback(() => {
+    const cacheKey = `${photoGenRef.current}|${photosRef.current.length}|${selectedBg}|${selectedFilter}`;
+    if (stripRenderRef.current.key === cacheKey && stripRenderRef.current.dataUrl) {
+      return Promise.resolve(stripRenderRef.current.dataUrl);
+    }
+
     return new Promise((resolve, reject) => {
       const canvas = stripCanvasRef.current;
       const sources = photosRef.current;
@@ -511,7 +515,11 @@ export default function PhotoBooth() {
             ctx.putImageData(region, pad, y);
           }
 
-          if (++loaded === PHOTO_COUNT) resolve(canvas.toDataURL('image/jpeg', 0.95));
+          if (++loaded === PHOTO_COUNT) {
+            const out = canvas.toDataURL('image/jpeg', 0.95);
+            stripRenderRef.current = { key: cacheKey, dataUrl: out };
+            resolve(out);
+          }
         };
         img.src = src;
       });
@@ -519,16 +527,35 @@ export default function PhotoBooth() {
   }, [selectedBg, selectedFilter]);
 
   const saveStrip = useCallback(async () => {
+    setSubmitError('');
     try {
-      const url = await generateStripCanvas();
+      const dataUrl = await generateStripCanvas();
+      const blob = await (await fetch(dataUrl)).blob();
+      const filename = `vintage-strip-club-${Date.now()}.jpg`;
+      const file = new File([blob], filename, { type: 'image/jpeg' });
+
+      // iOS Safari ignores the <a download> attribute entirely, which is
+      // why this button did nothing on a phone. The share sheet is the
+      // only route to the camera roll there.
+      if (navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'Vintage Strip Club' });
+        return;
+      }
+
+      // Desktop browsers: a real object-URL download.
+      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.download = `vintage-strip-club-${Date.now()}.jpg`;
       a.href = url;
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();
-    } catch {
-      setSubmitError('Could not build your strip image. Please try again.');
+      setTimeout(() => URL.revokeObjectURL(url), 10_000);
+      setSaveNotice('Saved to your downloads');
+    } catch (err) {
+      // Dismissing the share sheet is a choice, not a failure.
+      if (err?.name === 'AbortError') return;
+      setSubmitError('Could not save your strip. Please try again.');
     }
   }, [generateStripCanvas]);
 
@@ -642,11 +669,12 @@ export default function PhotoBooth() {
     setPhotos([]); photosRef.current = [];
     // New photos mean the uploaded assets no longer describe this order.
     uploadCacheRef.current = null;
+    stripRenderRef.current = { key: '', dataUrl: null };
     uploadSessionRef.current = null;
     setCapturedDots(EMPTY_DOTS); setPhotoCount(0);
     setSubmitError('');
     abortRef.current = false;
-    prewarmDoneRef.current = false;
+    dualStreamRef.current = null;
     setScreen('camera');
     await startCamera(facingMode);
   }, [facingMode, startCamera]);
@@ -656,6 +684,7 @@ export default function PhotoBooth() {
     setPhotos([]); photosRef.current = [];
     uploadCacheRef.current = null;
     uploadSessionRef.current = null;
+    stripRenderRef.current = { key: '', dataUrl: null };
     setSelectedBg('white'); setSelectedFilter('original');
     setOrderQty(1); setGiftMode(false);
     setForm(EMPTY_FORM); setGiftForm(EMPTY_GIFT);
@@ -678,6 +707,23 @@ export default function PhotoBooth() {
     // Abandon any in-flight upload rather than leaking the request.
     uploadAbortRef.current?.abort();
   }, []);
+
+  // Warm the strip render as soon as the result screen appears. Without
+  // this, Save has to await image decoding first, which on iOS exceeds
+  // the transient-activation window and makes navigator.share() throw.
+  useEffect(() => {
+    if (screen !== 'result' || photos.length !== PHOTO_COUNT) return;
+    let cancelled = false;
+    generateStripCanvas().catch(() => { if (!cancelled) { /* surfaced on Save */ } });
+    return () => { cancelled = true; };
+  }, [screen, photos.length, selectedBg, selectedFilter, generateStripCanvas]);
+
+  // Clear the save confirmation after a moment.
+  useEffect(() => {
+    if (!saveNotice) return;
+    const id = setTimeout(() => setSaveNotice(''), 2500);
+    return () => clearTimeout(id);
+  }, [saveNotice]);
 
   // Release the camera whenever the app is backgrounded outside capture.
   useEffect(() => {
@@ -765,6 +811,12 @@ export default function PhotoBooth() {
                 </div>
               )}
 
+              {!cameraReady && !cameraError && (
+                <div className="absolute inset-0 z-20 flex items-center justify-center bg-dark">
+                  <span className="text-[0.6rem] tracking-[0.25em] uppercase text-cream/50">Starting camera…</span>
+                </div>
+              )}
+
               {switchingCamera && (
                 <div className="absolute inset-0 z-25 flex items-center justify-center bg-black/40 backdrop-blur-[2px] pointer-events-none">
                   <span className="text-[0.6rem] tracking-[0.2em] uppercase text-cream/90">Switching camera…</span>
@@ -812,7 +864,7 @@ export default function PhotoBooth() {
       {screen === 'result' && (
         <div className="min-h-dvh flex flex-col items-center bg-dark px-6 pt-[max(1rem,env(safe-area-inset-top))] pb-[max(1.5rem,env(safe-area-inset-bottom))]">
           <div className="text-center mb-3">
-            <h2 className="font-[Playfair_Display,serif] font-black text-xl tracking-[0.1em] uppercase">Your Strip</h2>
+            <h2 className="font-[Playfair_Display,serif] font-black text-xl tracking-[0.1em] uppercase">Looking Good!</h2>
           </div>
 
           <div className="flex-1 flex items-center justify-center w-full overflow-hidden py-2">
@@ -829,6 +881,7 @@ export default function PhotoBooth() {
           </div>
 
           {submitError && <p className="text-[0.6rem] text-red mb-2" role="alert">{submitError}</p>}
+          {saveNotice && <p className="text-[0.6rem] text-success mb-2" role="status">{saveNotice}</p>}
 
           <div className="flex gap-2.5 mt-3 w-full max-w-[360px]">
             <button onClick={retake} className="flex-1 py-3.5 px-2 rounded-md font-[DM_Mono,monospace] text-[0.6rem] font-medium tracking-[0.08em] uppercase text-cream border border-cream/15 bg-transparent active:scale-[0.96] transition-all">Retake</button>

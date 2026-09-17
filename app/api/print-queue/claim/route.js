@@ -38,9 +38,11 @@ export async function POST(request) {
         filter: order.filter,
         attempts: order.print_attempts,
         frameUrls: frames,
+        // Matches getDateString() on the client — no comma before the
+        // year, so the printed caption reads the same as the preview.
         dateText: new Date(order.created_at).toLocaleDateString('en-US', {
           month: 'long', day: 'numeric', year: 'numeric',
-        }),
+        }).replace(',', ''),
       },
     });
   } catch (err) {
